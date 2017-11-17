@@ -1,0 +1,814 @@
+<div id="totals-slide-in-section" style="height: 78px;">
+	<div id="totals-slide-in" style="height: 75px;">
+		<div id="totals-section-content" style="height: 108px;">
+			<span id="totals-slide-in-handle" class="glyphicon glyphicon-chevron-down"></span>
+			<div id="totals-grid" style="height: 108px;"></div>
+			<div id="selection-stats" style="display: none;">
+				Average: <span id="selection-average"></span>
+				Count: <span id="selection-count"></span>
+				Sum: <span id="selection-sum"></span>
+			</div><!-- #selection-stats -->
+		</div><!-- #totals-section-content -->
+	</div><!-- #totals-slide-in -->
+</div><!-- #totals-slide-in-section -->
+
+<script>
+
+	var MEASURE_WIDTH,
+		ANCHOR_TOOLTIPS = {
+			Variance: 'The difference between Actual total liquidity and target total liquidity. A positive number indicates that we have excess liquidity (under invested) while a negative number indicates that liquidity is below target (over invested)',
+			Total: 'Forecast of investors\' total balance in the fund less cash set aside for FX hedging',
+			Churn_Calculator: 'The estimated lowest level of cash + VFN availability over the month end period. Calculated as Total liquidity before month end - LP investments + AT investor Contributions - SMA funding +/- Interfund flows +/- SMA Pro-rata Rebalancing - Expenses + Lowest Liquidity Delta from CLIPS',
+		},
+		TARGET_CASH = {};
+
+	$(document).ready(function () {
+		MEASURE_WIDTH = allocSheetCellWidths.InvestmentName + 50;
+
+		$('#totals-slide-in-handle').click(function () {
+			sliderExpanded = !sliderExpanded;
+			
+			var topRowHeight = 21,
+				slideInHeight = parseInt($('#totals-slide-in').height()),
+				slideInSectionHeight = slideInHeight + 3;
+			if ($(this).hasClass('glyphicon-chevron-down')) {
+				
+				$('#totals-slide-in').css({ 'bottom': (-1 * slideInSectionHeight + topRowHeight) + 'px' });
+				$('#totals-slide-in-section').height(topRowHeight);
+				$(this).removeClass('glyphicon-chevron-down');
+				$(this).addClass('glyphicon-chevron-up');
+				
+			} else {
+				
+				$('#totals-slide-in-section').height(slideInSectionHeight);
+				$('#totals-slide-in').css({ 'bottom': '0' });
+				$(this).removeClass('glyphicon-chevron-up');
+				$(this).addClass('glyphicon-chevron-down');
+				
+			}
+			$(window).trigger('resize');
+		});
+
+		var $totalsGrid = $('#totals-grid');
+		shortTermCalcs.onRefresh(function () {
+			console.time('anchorRefresh');
+			var totalsGridData = $totalsGrid.data('kendoGrid');
+			if (totalsGridData) {
+				totalsGridData.refresh();
+				fixWidthGrids();
+			}
+			console.timeEnd('anchorRefresh');
+		});
+	});
+
+	function initTSGrid() {
+		var $totalsGrid = $('#totals-grid');
+		$totalsGrid.css('left', 33);
+		APSDataService.post({
+			url: "{% url 'datafeed:cash_section_data' %}",
+			data: JSON.stringify({ dates: _dates, as_of: mioUtils.parseURLQuery().as_of }),
+			appcache: {
+				key: 'stats_processor.prepare_cash_section_data'
+			},
+			error: function(resp){
+				var errorMessage = resp.responseText;
+				$totalsGrid.html("<div id='anchor-error' class='alert alert-warning' style='text-align:center;padding-top:1em;font-size:15px;font-family:monospace;color:#800000;'>"+
+							errorMessage+"</div>");
+            	$(window).trigger('resize');
+			},
+			success: function (resp) {
+				var sortOrder = ['Variance', 'Total', 'Churn_Calculator', 'ProRata'],
+					data = resp.data;
+				for (var key in resp.target_cash) {
+					TARGET_CASH[key] = resp.target_cash[key].TARGET_CASH;
+				}
+				data = data.sort(function (a, b) { return sortOrder.indexOf(a.measure) - sortOrder.indexOf(b.measure); });
+
+				$totalsGrid.kendoGrid({
+					dataSource: data,
+					dataBound: function () {
+						$totalsGrid.children('.k-grid-content').bindScrollbar($('#grid .k-grid-content'), { horizontal: true });
+		                $totalsGrid.find('.simple-qtip').each(function () {
+		                	$(this).simpleQtip();
+		                });
+		                initProRataInput();
+		                $(window).trigger('resize');
+					},
+		            columns: getTSColumns(),
+		            scrollable: true
+				});
+				$('#pro-rata-multiplier').data('kendoNumericTextBox').trigger('change');
+			}
+		});
+	}
+
+	function getTSColumns() {
+		var columns = [{
+				field: 'measure',
+				title: ' ',
+				template: measureTemplate,
+				attributes: {
+					'style': 'font-weight: bold; white-space: pre-wrap; text-align: center; border-right-width: 1px;',
+					'class': '#= ANCHOR_TOOLTIPS[data.measure] ? "simple-qtip" : "" #',
+					'title': '#= ANCHOR_TOOLTIPS[data.measure] || "" #',
+					'data-position-my': 'bottom-left'
+				},
+				width: MEASURE_WIDTH,
+				locked: true
+			}],
+		    months = getDefaultArray(_dates.length, function (i) { return 'M' + i }),
+		    headerAttributes = {'style': 'font-weight: bold; text-align: center;'};
+		
+		for (var i = 0; i < _product_ids.length; i++) {
+			columns.push({
+				title: prodAbbrevs[_product_ids[i]],
+				headerAttributes: headerAttributes,
+				columns: $.map(months, function (e) {
+					var field = e + '_' + _product_ids[i];
+					return {
+						field: field,
+						title: getTitle(e),
+						template: '#= anchorTemplate(data, "' + field + '") #',
+						attributes: getAttributes(field),
+						headerAttributes: headerAttributes,
+						width: allocSheetCellWidths.allocations.months,
+						hidden: isHiddenTSCol(field)
+					};
+				})
+			});
+			
+			if (i < _product_ids.length - 1) {
+				columns.push({
+					field: `${_products[i]}.New`,
+					template: ' ',
+					title: ' ',
+					width: allocSheetCellWidths.allocations.new,
+					attributes: { 'class': 'anchor-col-separator' },
+					headerAttributes: { 'class': 'anchor-col-separator' }
+				});
+			}
+		}
+
+		var fields = _dates.map(function (e) {
+		    return 'ssifTest2.{}.EndBalance'.formatStr([e]);
+		});
+		var test2_fields = _dates.map(function (e) {
+		    return 'ssifTest1.{}.EndBalance'.formatStr([e]);
+		});
+		headerAttributes = {'style': 'font-weight: bold; text-align: center;'};
+		columns.push({
+				
+				field: `${_products[_products.length - 1]}.New`,
+				title: ' ',
+				template: ' ',
+				width: allocSheetCellWidths.allocations.new,
+				attributes: {'class': 'anchor_padding'},
+				headerAttributes: { 'class': 'anchor_padding', 'style': 'font-weight: bold; text-align: center;' }
+			}); 
+		
+		var field = 'ssiftest1.cur',
+			attributes = { 'class': 'section-separator cur tests-column ssif-test-1', 'data-month': _dates[0], 'data-field': field, 'style': 'font-weight: bold; text-align: center;'},
+			headerAttributes = { 'class': 'tests-column ssif-test-1' };
+		columns.push({
+	         field: field,
+	         template: '#= anchorTest2Template(data, "' + 'ssifTest1' + '") #',
+	         attributes: attributes,
+	         headerAttributes: headerAttributes,
+	         footerAttributes: attributes,
+	         groupFooterAttributes: attributes,
+	         width: allocSheetCellWidths.ssifTest1,
+	         hidden: isHiddenTSCol(field)
+	    });
+		
+		var field = 'ssifTest2.cur',
+			attributes = { 'class': 'section-separator cur tests-column ssif-test-2', 'data-month': _dates[0], 'data-field': field, 'style': 'font-weight: bold; text-align: center;'},
+			headerAttributes = { 'class': 'tests-column ssif-test-2', 'style': 'font-weight: bold; text-align: center;' };
+		columns.push({
+	         field: field,
+	         template: '#= anchorTest2Template(data, "' + fields[0] + '") #',
+	         attributes: attributes,
+	         headerAttributes: headerAttributes,
+	         footerAttributes: attributes,
+	         groupFooterAttributes: attributes,
+	         hidden: isHiddenTSCol(field),
+	         width: allocSheetCellWidths.ssifTest2.cur
+	    });
+		for (var i = 1; i < _dates.length; i++) {
+			field = 'ssifTest2.' + _dates[i];
+			attributes = { 'class': 'tests-column ssif-test-2', 'data-month': _dates[i], 'data-field': fields[i], 'style': 'font-weight: bold; text-align: center;'};
+			headerAttributes = { 'class': 'tests-column ssif-test-2', 'data-month': _dates[i], 'style': 'font-weight: bold; text-align: center;' };
+			var date = kendo.parseDate(_dates[i], '_yyyyMMdd'),
+				title = kendo.toString(date, 'MMM');
+			columns.push({
+		         title: title,
+		         field: field,
+		         template: '#= anchorTest2Template(data, "' + fields[i] + '") #',
+		         attributes: attributes,
+		         headerAttributes: headerAttributes,
+		         footerAttributes: attributes,
+		         groupFooterAttributes: attributes,
+		         hidden: isHiddenTSCol(field),
+		         width: allocSheetCellWidths.ssifTest2.months
+		    });
+		}
+
+		attributes = { 'class': 'tests-column ssif-test-2', 'data-field': 'ssifTest2.new', 'style': 'font-weight: bold; text-align: center;'};
+		headerAttributes = { 'class': 'tests-column ssif-test-2', 'style': 'font-weight: bold; text-align: center;' };
+	    columns.push({
+	        field: 'ssifTest2.new',
+	 		template: '#= anchorTest2Template(data, "ssifTest2.new.EndBalance") #',
+	 		attributes: attributes,
+	 		headerAttributes: headerAttributes,
+	 		footerAttributes: attributes,
+	 		groupFooterAttributes: attributes,
+	 		//hidden: false,
+	 		width: allocSheetCellWidths.ssifTest2.new
+	    });
+
+	    for (var i = 0; i < _products.length; i++) {
+	    	attributes = { 'class': 'numeric exposure cur section-separator', 'data-product': _products[i], 'data-field': 'exposures.{}.cur'.formatStr(_products[i]), 'style': 'font-weight: bold; text-align: center;'};
+			headerAttributes = { 'class': 'numeric exposure cur', 'style': 'font-weight: bold; text-align: center;' };
+	    	columns.push({
+		        field: 'exposures.{}.cur'.formatStr([_products[i]]),
+		 		template: '#= anchorVarianceTemplate(data, "' + 'exposures.{}.cur'.formatStr([_products[i]]) + '","' + _products[i] +  '","' + _dates[0] + '") #',
+		 		attributes: attributes,
+		 		headerAttributes: headerAttributes,
+		 		footerAttributes: attributes,
+		 		groupFooterAttributes: attributes,
+		 		//hidden: false,
+		 		width: allocSheetCellWidths.totals
+		    });
+
+			for (var j = 1; j < _dates.length; j++) {
+				var field = 'exposures.{}.{}'.formatStr([_products[i], _dates[j]]),
+					attributes = { 'class': 'numeric exposure simple-qtip', 'data-month': _dates[i], 'data-product': _products[i], 'data-field': field, 'style': 'font-weight: bold; text-align: center;'},
+					headerAttributes = { 'class': 'numeric exposure simple-qtip', 'style': 'font-weight: bold; text-align: center;' };
+				
+				var date = kendo.parseDate(_dates[i], '_yyyyMMdd'),
+					title = kendo.toString(date, 'MMM');
+				columns.push({
+			         title: title,
+			         field: field,
+			         template: '#= anchorVarianceTemplate(data, "' + 'exposures.{}.{}'.formatStr([_products[i], _dates[j]]) + '","' + _products[i] +  '","' + _dates[j] + '") #',
+			         attributes: attributes,
+			         headerAttributes: headerAttributes,
+			         footerAttributes: attributes,
+			         groupFooterAttributes: attributes,
+			         hidden: isHiddenTSCol(field),
+			         width: allocSheetCellWidths.ssifTest2.months
+			    });
+			}
+		}
+
+	    var separatorAttributes = { 'class': 'section-separator' },
+	    	totalAttributes = { 'style': 'text-align: center;font-weight: bold;', 'class': 'totals-column' },
+		    totalHeaderAttributes = { 'class': 'totals-column', 'style': 'font-weight: bold; text-align: center;' },
+		    curTotalAttributes = $.extend(true, {}, separatorAttributes, totalAttributes, { 'class': 'simple-qtip addHoverCur', 'data-field': 'totals.cur' });
+		    curTotalAttributes['class'] += ' section-separator cur';
+	    columns.push({
+		    title: 'Cur',
+	        field: 'totals.cur',
+	        attributes: { 'class': 'tests-column totals.cur', 'data-field': 'totals.cur', 'style': 'font-weight: bold; text-align: center;'},
+	        headerAttributes: totalHeaderAttributes,
+	        footerAttributes: curTotalAttributes,
+	        groupFooterAttributes: curTotalAttributes,
+	        template: '#= anchorSSCompositeCurTemplate(data, "' + 'totals.cur' + '","' + 'totals' +  '","' + _dates[_dates.length - 1] + '") #',
+	        width: allocSheetCellWidths.totals
+	    });
+	    
+	    for (var i = 1; i < _dates.length; i++) {
+			field = 'totals.{}'.formatStr([_dates[i]]);
+			attributes = { 'class': 'tests-column totals', 'data-month': _dates[i], 'data-field': field, 'style': 'font-weight: bold; text-align: center;'};
+			headerAttributes = { 'class': 'numeric total all-prods', 'data-month': _dates[i], 'style': 'font-weight: bold; text-align: center;' };
+			var date = kendo.parseDate(_dates[i], '_yyyyMMdd'),
+				title = kendo.toString(date, 'MMM');
+			columns.push({
+		         title: title,
+		         field: field,
+		         template: '#= anchorVarianceTemplate(data, "' + field + '","' + 'exposure' +  '","' + _dates[i] + '") #',
+		         attributes: attributes,
+		         headerAttributes: headerAttributes,
+		         footerAttributes: attributes,
+		         groupFooterAttributes: attributes,
+		         hidden: true,
+		         width: allocSheetCellWidths.totals
+		    });
+		}
+	    
+	    columns.push({
+		    title: 'New',
+	        field: 'totals.new',
+	        attributes: { 'class': 'tests-column totals.new', 'data-field': 'totals.new', 'style': 'font-weight: bold; text-align: center;'},
+	        headerAttributes: totalHeaderAttributes,
+	        footerAttributes: curTotalAttributes,
+	        groupFooterAttributes: curTotalAttributes,
+	        template: '#= anchorSSCompositeNewTemplate(data, "' + 'totals.new' + '","' + 'totals' +  '","' + _dates[_dates.length - 1] + '") #',
+	        width: allocSheetCellWidths.totals
+	    });
+
+	    columns.push({
+	        field: 'exposures.total.cur',
+	 		template: '#= anchorVarianceTemplate(data, "' + 'exposures.totals.cur' + '","' + 'total' +  '","' + _dates[0] + '") #',
+	 		attributes: { 'class': 'numeric exposure all-prods cur', 'data-field': 'exposures.total.cur', 'style': 'font-weight: bold; text-align: center;'},
+	 		headerAttributes: headerAttributes,
+	 		footerAttributes: attributes,
+	 		groupFooterAttributes: attributes,
+	 		//hidden: false,
+	 		width: allocSheetCellWidths.exposures.totals.cur
+	    });
+
+		for (var i = 1; i < _dates.length; i++) {
+			field = 'exposures.total.{}'.formatStr([_dates[i]]);
+			attributes = { 'class': 'tests-column exposures-totals', 'data-month': _dates[i], 'data-field': field, 'style': 'font-weight: bold; text-align: center;'};
+			headerAttributes = { 'class': 'numeric exposure all-prods', 'data-month': _dates[i], 'style': 'font-weight: bold; text-align: center;' };
+			var date = kendo.parseDate(_dates[i], '_yyyyMMdd'),
+				title = kendo.toString(date, 'MMM');
+			columns.push({
+		         title: title,
+		         field: field,
+		         template: '#= anchorVarianceTemplate(data, "' + field + '","' + 'total' +  '","' + _dates[i] + '") #',
+		         attributes: attributes,
+		         headerAttributes: headerAttributes,
+		         footerAttributes: attributes,
+		         groupFooterAttributes: attributes,
+		         hidden: true,
+		         width: allocSheetCellWidths.exposures.totals.months
+		    });
+		}
+		columns.push({
+	        field: 'exposures.total.new',
+	 		template: '#= anchorVarianceTemplate(data, "' + 'exposures.total.new' + '","' + 'total' +  '","new") #',
+	 		attributes: { 'class': 'numeric exposure all-prods new', 'data-field': 'exposures.total.new', 'style': 'font-weight: bold; text-align: center;'},
+	 		headerAttributes: headerAttributes,
+	 		footerAttributes: attributes,
+	 		groupFooterAttributes: attributes,
+	 		//hidden: false,
+	 		width: allocSheetCellWidths.exposures.totals['new']
+	    });
+
+		columns.push(getBlankColumn({ field: 'NEXT_NOTICE_DATE', width: allocSheetCellWidths.NEXT_NOTICE_DATE }));
+		columns.push(getBlankColumn({ field: 'LIQUIDITY_MONTH', width: allocSheetCellWidths.LIQUIDITY_MONTH }));
+
+		return columns;
+	}
+
+	function getBlankColumn(extras) {
+	    var defaults = {
+			title: ' ',
+			template: ' ',
+			width: allocSheetCellWidths.exposures.products,
+			attributes: { 'class': 'anchor_padding' },
+			headerAttributes: { 'class': 'anchor_padding' }
+		};
+	    return $.extend({}, defaults, extras);
+	}
+
+	function getTitle(month) {
+		var monthNum = parseInt(month.substr(1));
+		if (monthNum == 0) {
+			return 'Cur';
+		} else {
+			var date = kendo.parseDate(_dates[monthNum], '_yyyyMMdd');
+			return kendo.toString(date, 'MMM');
+		}
+	}
+
+	function getAttributes(field) {
+		var attributes = {
+			'style': 'font-weight: bold; text-align: center;',
+			'class': '#= getCellClasses(data, "' + field + '") #',
+			'title': '#= getCellToolTip(data, "' + field + '") #',
+			'data-position-at': 'top-right',
+			'data-position-my': 'bottom-left'
+		};
+		if (['M0', 'M1'].indexOf(field.split('_')[0]) >= 0) {
+			attributes['class'] += ' anchor-thick-border-col';
+		}
+		return attributes;
+	}
+
+	function getWidth(field) {
+		return allocSheetCellWidths.allocations;
+	}
+
+	function isHiddenTSCol(field) {
+		var gridColumns = $('#grid').data('kendoGrid').columns;
+	    if (field.match(/M\d+_\d+/g)) {
+		    var date = _dates[parseInt(field.match(/\d+(?=_)/g)[0])],
+		    	productId = parseInt(field.match(/\d+$/g)[0]),
+		    	product = _products[_product_ids.indexOf(productId)],
+		    	productColumns = gridColumns.filter(e => e.title === product)[0].columns,
+		    	fieldColumn = productColumns.filter(e => e.field === `${product}.${date}.EndBalance`)[0];
+			return fieldColumn.hidden;
+		} else {
+			var col = getKendoColumn(field, gridColumns);
+			return col && col.hidden;
+		}
+	}
+
+	function anchorTemplate(data, field) {
+		var value = getCellValue(data, field),
+			formatStr = (data.measure == 'ProRata') ? 'n2' : 'n0';
+		return toApsFormat(value, formatStr);
+	}
+
+	function anchorTest2Template(data, field) {
+		var aggregates = $('#grid').data('kendoGrid').dataSource.view()[0].aggregates;
+		field = field.replace('new', _dates[_dates.length - 1]);
+		if (data.measure == 'Total') {
+			return kendo.toString(aggregates[field].sum, 'p0');
+		}
+		return '';
+	}
+
+	function getAnchorTotalCurVariance(data){
+		var variance = 0;
+		var anav = 0;
+		for (var i = 0; i < _products.length; i++) {
+			var prodId = getProductId(_products[i]),
+  				productAbbrev = prodAbbrevs[prodId];
+			
+			//anav += ANAV[_dates[0]][productAbbrev];
+			variance += apsAnchorCalcs.calculate(data.measure, data, 'M0'+'_'+prodId);
+			
+		}
+		var color = 'white';	
+		variance = variance / 1000000
+		valueString = kendo.toString(variance, 'n0');
+		if (variance < 0){
+			variance = -1 * variance
+			valueString = kendo.toString(variance, 'n0');
+	    	valueString = '(' + valueString + ')';
+	        color = '#FE9494';
+	    }
+	    return '<span style="color:' + color + '">'+valueString+'</span>';
+	}
+	
+	function getAnchorTotalNewVariance(data){
+		var variance = 0;
+		var anav = 0;
+		for (var i = 0; i < _products.length; i++) {
+			var prodId = getProductId(_products[i]),
+  				productAbbrev = prodAbbrevs[prodId];
+			
+			//anav += ANAV[_dates[_dates.length - 1]][productAbbrev];
+			variance += apsAnchorCalcs.calculate(data.measure, data, 'M13'+'_'+prodId);
+			
+		}
+		var color = 'white';	
+		variance = variance / 1000000
+		valueString = kendo.toString(variance, 'n0');
+		if (variance < 0){
+			variance = -1 * variance
+			valueString = kendo.toString(variance, 'n0');
+	    	valueString = '(' + valueString + ')';
+	        color = '#FE9494';
+	    }
+	    return '<span style="color:' + color + '">'+valueString+'</span>';
+	}
+	
+	function getAnchorTotalDeltaVariance(data){
+		var curVariance = 0,
+			curAnav = 0,
+			newVariance = 0,
+			newAnav = 0,
+			ret_value = 0;
+		for (var i = 0; i < _products.length; i++) {
+			var prodId = getProductId(_products[i]),
+  				productAbbrev = prodAbbrevs[prodId];
+			
+			//curAnav += ANAV[_dates[0]][productAbbrev];
+			curVariance += apsAnchorCalcs.calculate(data.measure, data, 'M0'+'_'+prodId);
+			
+		}
+		for (var i = 0; i < _products.length; i++) {
+			var prodId = getProductId(_products[i]),
+  				productAbbrev = prodAbbrevs[prodId];
+			
+			//newAnav += ANAV[_dates[_dates.length - 1]][productAbbrev];
+			newVariance += apsAnchorCalcs.calculate(data.measure, data, 'M13'+'_'+prodId);
+			
+		}
+		ret_value = newVariance - curVariance;
+		ret_value = ret_value / 1000000
+		var color = 'white';		
+		valueString = kendo.toString(ret_value, 'n0');
+		if (ret_value < 0){
+			ret_value = -1 * ret_value
+			valueString = kendo.toString(ret_value, 'n0');
+	    	valueString = '(' + valueString + ')';
+	        color = '#FE9494';
+	    }
+	    return '<span style="color:' + color + '">'+valueString+'</span>';
+	}
+	
+	function getAnchorVariance(data, field, product, date){
+		var anav = 0,
+  			variance = 0;
+	
+		var ret_value = 0;
+		if (date == 'new' && field.indexOf('exposures') >= 0) {
+			date = _dates[AllocationSheetGrid.settings.visibleMonths];
+		}
+		if(product=='total'){
+			for (var i = 0; i < _products.length; i++) {
+				prodId = getProductId(_products[i])
+	  			productAbbrev = prodAbbrevs[prodId]
+				anav += ANAV[_dates[_dates.indexOf(date)]][productAbbrev];
+				variance += apsAnchorCalcs.calculate(data.measure, data, 'M' + _dates.indexOf(date) + '_' + prodId);
+				
+			}
+			ret_value = variance / anav
+		}
+		else{
+			var prodId = getProductId(product),
+  				productAbbrev = prodAbbrevs[prodId];
+			var anav = ANAV[date][productAbbrev];
+			var variance = apsAnchorCalcs.calculate(data.measure, data, 'M' + _dates.indexOf(date) + '_' + prodId);
+			
+			ret_value = variance/anav
+		}
+		var color = 'white';		
+		valueString = kendo.toString(ret_value, 'p1');
+		if (ret_value < 0){
+			valueString = kendo.toString(ret_value, 'p1');
+	        color = '#FE9494';
+	    }
+	    return '<span style="color:' + color + '">'+valueString+'</span>';
+	}
+	
+	function anchorVarianceTemplate(data, field, product, date) {
+		var aggregates = $('#grid').data('kendoGrid').dataSource.view()[0].aggregates
+		var ret_val = ''
+		if (data.measure == 'Variance') {
+			return getAnchorVariance(data, field, product, date)
+		}
+		return ret_val
+		
+	}
+	
+	function anchorSSCompositeCurTemplate(data, field, product, date) {
+// 		var data_items = $('#grid').data('kendoGrid').dataSource.view()[0].items
+		var total  = 0;
+		if (data.measure == 'Total'){
+// 			for (k = 0; k < data_items.length; k++) {
+// 			    for (var i = 0; i < _products.length; i++) {
+// 		            if (data_items[k].value.indexOf("SHORT TERM INVESTMENTS & LIQUIDITY") < 0) {
+// 		                var field = '{}.{}.EndBalance'.formatStr([_products[i], _dates[0]]);
+// 		                total += data_items[k].aggregates[field].sum;  
+// 			        }
+// 			    }
+// 			}
+			for (var i = 0; i < _product_ids.length; i++) {
+				total += data[`M0_${_product_ids[i]}`]
+			}
+			total /= 1000000;
+			var color = 'white';	
+			valueString = kendo.toString(total, 'n0')
+			if (total < 0){
+				total = -1 * total
+				valueString = kendo.toString(total, 'n0');
+		    	valueString = '(' + valueString + ')';
+		        color = '#FE9494';
+		    }
+		    return '<span style="color:' + color + '">'+valueString+'</span>';
+		}
+		
+		if (data.measure == 'Variance'){
+			return getAnchorTotalCurVariance(data)
+		}
+		
+		return ''
+		
+	}
+	
+	function anchorSSCompositeDeltaTemplate(data, field, product, date) {
+// 		var data_items = $('#grid').data('kendoGrid').dataSource.view()[0].items
+		var total  = 0;
+		if (data.measure == 'Total'){
+// 			for (k = 0; k < data_items.length; k++) {
+// 			    for (var i = 0; i < _products.length; i++) {
+// 			        for (var j = 1; j < _dates.length; j++) {
+// 			            if (data_items[k].value.indexOf("SHORT TERM INVESTMENTS & LIQUIDITY") < 0) {
+// 			                var field = '{}.{}.EndBalance'.formatStr([_products[i], _dates[j]]);
+// 			                total += data_items[k].aggregates[field].sum;
+// 			            }
+// 			        }
+// 			    }
+// 			}
+			for (var i = 0; i < _product_ids.length; i++) {
+				total += data[`M13_${_product_ids[i]}`] - data[`M0_${_product_ids[i]}`]
+			}
+			total /= 1000000;
+			var color = 'white';	
+			valueString = kendo.toString(Math.round(total), 'n0');
+			if (total < 0){
+				total = -1 * total
+				valueString = kendo.toString(Math.round(total), 'n0');
+		    	valueString = '(' + valueString + ')';
+		        color = '#FE9494';
+		    }
+		    return '<span style="color:' + color + '">'+valueString+'</span>';
+		}
+		if (data.measure == 'Variance'){
+			return getAnchorTotalDeltaVariance(data)
+		}
+		
+		return ''
+	}
+	function anchorSSCompositeNewTemplate(data, field, product, date) {
+// 		var data_items = $('#grid').data('kendoGrid').dataSource.view()[0].items
+		var total  = 0;
+		if (data.measure == 'Total'){
+// 			for (k = 0; k < data_items.length; k++) {
+// 			    for (var i = 0; i < _products.length; i++) {
+// 			        for (var j = 0; j < _dates.length; j++) {
+// 			            if (data_items[k].value.indexOf("SHORT TERM INVESTMENTS & LIQUIDITY") < 0) {
+// 			                var field = '{}.{}.EndBalance'.formatStr([_products[i], _dates[j]]);
+// 			                total += data_items[k].aggregates[field].sum;
+// 			            }
+// 			        }
+// 			    }
+// 			}
+			for (var i = 0; i < _product_ids.length; i++) {
+				total += data[`M13_${_product_ids[i]}`]
+			}
+			total /= 1000000;
+			var color = 'white';	
+			valueString = kendo.toString(Math.round(total), 'n0');
+			if (total < 0){
+				total = -1 * total
+				valueString = kendo.toString(Math.round(total), 'n0');
+		    	valueString = '(' + valueString + ')';
+		        color = '#FE9494';
+		    }
+		    return '<span style="color:' + color + '">'+valueString+'</span>';
+		}
+		if (data.measure == 'Variance'){
+			return getAnchorTotalNewVariance(data)
+		}
+
+		return ''		
+	}
+	
+	function getCellValue(dataItem, field) {
+		var calcType = dataItem.measure,
+			data = $('#totals-grid').data('kendoGrid').dataSource.data();
+		return apsAnchorCalcs.calculate(calcType, dataItem, field, data);
+	}
+
+	function getCellClasses(dataItem, field) {
+		var value = getCellValue(dataItem, field),
+			cssClass = '';
+		if (value < 0) {
+			cssClass += ' negative-cell';
+		}
+		if (dataItem.measure == 'Churn_Calculator' && value != null) {
+			var productId = field.split('_')[1],
+				product = prodAbbrevs[productId];
+			if (value / TARGET_CASH[product] < .5) {
+				cssClass += ' churn-warning-severe';
+			} else if (value / TARGET_CASH[product] < .9) {
+				cssClass += ' churn-warning-mild';
+			}
+		}
+		return cssClass;
+	}
+
+	function getCellToolTip(dataItem, field) {
+		var str = kendo.toString(getCellValue(dataItem, field)/1000000 || "", "n0");
+		if (str.length >= 6) {
+			return str;
+		} else {
+			return '';
+		}
+	}
+
+	function measureTemplate(dataItem) {
+		var templateDict = {
+			ProRata: 'Pro Rata <input id="pro-rata-multiplier" style="display: none;">',
+			Churn_Calculator: 'Lowest Liquidity',
+			Total: 'ANAV Forecast',
+			Variance: 'Excess Liquidity'
+		};
+		return templateDict[dataItem.measure] || dataItem.measure;
+	}
+
+	function toApsFormat(number, formatStr) {
+		if (number == null) {
+			return '';
+		}
+		if (number < 0) {
+			var formattedVal = -1 * number / getAnchorMultiplier();
+			return  '(' + kendo.toString(formattedVal, formatStr || 'n1') + ')';
+		} else {
+			var formattedVal = (number / getAnchorMultiplier()) || 'N/A';
+			return  kendo.toString(formattedVal, formatStr || 'n1');
+		}
+	}
+
+	function showAnchorGridMonths(number, product, section) {
+		var hideFields = [],
+			showFields = [],
+			datesToShow = _dates.slice(1, number + 1),
+			datesToHide = _dates.slice(number + 1, maxMonths),
+			maxMonths = _dates.length,
+			$grid = $('#totals-grid'),
+			grid = $grid.data('kendoGrid');
+		if (product) {
+			var idx = _products.indexOf(product),
+				productId = _product_ids[idx];
+			showFields = datesToShow.map((_, i) => `M${i + 1}_${productId}`);
+			hideFields = datesToHide.map((_, i) => `M${i + number + 1}_${productId}`);
+		} else if (section) {
+			if (['exposures.total', 'ssifTest2'].indexOf(section) < 0) {
+				var lastMonth = _dates[AllocationSheetGrid.settings.visibleMonths];
+				datesToShow = Array.from(new Set([...datesToShow, lastMonth]));
+				datesToHide = datesToHide.filter(date => date !== lastMonth);
+			}
+			showFields = datesToShow.map(date => `${section}.${date}`);
+			hideFields = datesToHide.map(date => `${section}.${date}`);
+		} else {
+		    _product_ids.forEach(productId => {
+				showFields = [...showFields, ...datesToShow.map((_, i) => `M${i + 1}_${productId}`)];
+				hideFields = [...hideFields, ...datesToHide.map((_, i) => `M${i + number + 1}_${productId}`)];
+			});
+		}
+		for (var i = 0; i < showFields.length; i++) {
+			grid.showColumn(showFields[i]);
+		}
+		for (var i = 0; i < hideFields.length; i++) {
+			grid.hideColumn(hideFields[i]);
+		}
+		$('#totals-grid').data('kendoGrid').refresh();
+	}
+
+	function saveProRata(value) {
+		localStorage.setItem('pro_rata', value);
+	}
+
+	function getProRata() {
+		var proRata = localStorage.getItem('pro_rata');
+		return parseFloat(proRata) || null;
+	}
+
+	function initProRataInput() {
+		var $input = $('#pro-rata-multiplier'),
+			initialValue = getProRata();
+		if (!$input.data('kendoNumericTextBox')) {
+			$input.kendoNumericTextBox({
+				change: setProRataInputs,
+				value: initialValue
+			});
+		}
+	}
+
+	function setProRataInputs(e) {
+        var val = parseFloat(e.sender.value() * 1000000) || 0;
+	    apsAnchorCalcs.setProRataInputs(val);
+        saveProRata(e.sender.value());
+        $('#totals-grid').data('kendoGrid').refresh();
+	}
+
+	function getNewAnchorRow(measure, defaultVal) {
+		var months = getDefaultArray(_dates.length, function (i) { return 'M' + i; }),
+			newRow = { measure: measure };
+		for (var i in months) {
+			for (var j in _product_ids) {
+				var field = months[i] + '_' + _product_ids[j];
+				newRow[field] = defaultVal;
+			}
+		}
+		return newRow;
+	}
+
+	function getAnchorMultiplier() {
+{#		return $('#anchor-multiplier').data('kendoDropDownList').value();#}
+		return 1000000.0;
+	}
+
+	function getAnchorField(allocationSheetField) {
+	    if (allocationSheetField == 'InvestmentName') {
+	        return 'measure';
+	    }
+	    var allProducts = _products.join('|'),
+		    allDates = _dates.join('|'),
+		    allocColumnPattern = new RegExp(`^(${allProducts})\\.(${allDates}).EndBalance`),
+		    groups = allocationSheetField.match(allocColumnPattern);
+	    if (groups) {
+	        var product = groups[1],
+	        	date = groups[2],
+	        	productId = _product_ids[_products.indexOf(product)],
+	        	month = _dates.indexOf(date);
+	        return `M${month}_${productId}`;
+	    }
+	    return allocationSheetField;
+	}
+
+	function getAnchorColumnWidth(field, width) {
+	    if (field == 'measure') {
+	        return width + 50;
+	    }
+	    return width;
+	}
+</script>
